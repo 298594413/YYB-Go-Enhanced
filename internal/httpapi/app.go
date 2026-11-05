@@ -374,7 +374,7 @@ func (a *App) Handler() http.Handler {
 	router := gin.New()
 	router.Use(a.logRequests(), gin.Logger(), gin.Recovery())
 
-	router.Any("/login", gin.WrapF(a.handleLogin))
+	router.Any("/login", gin.WrapF(a.handleUnifiedLogin))
 	router.Any("/register", gin.WrapF(a.handleRegister))
 	router.Any("/logout", gin.WrapF(a.handleLogout))
 	healthHandler := func(c *gin.Context) {
