@@ -26,12 +26,15 @@ func testBreaker(t *testing.T) (*circuitBreaker, *time.Time) {
 
 func TestTargetBreakerHoldsOffThenRecovers(t *testing.T) {
 	b, now := testBreaker(t)
-	// A single rejection is not enough (default threshold is 2).
+	// A single rejection is not enough; the target opens on the configured threshold.
 	if b.record(1, "wxA", "", circuitAppReject) != "" || b.check(1, "wxA", "") != nil {
 		t.Fatal("target opened too early")
 	}
+	for range defaultCircuitConfig().TargetAppRejects - 2 {
+		b.record(1, "wxA", "", circuitAppReject)
+	}
 	if scope := b.record(1, "wxA", "", circuitAppReject); scope != "target" {
-		t.Fatalf("second -14 did not open the target: %q", scope)
+		t.Fatalf("threshold -14 did not open the target: %q", scope)
 	}
 	var open *circuitOpenError
 	if err := b.check(1, "wxA", ""); !errors.As(err, &open) || open.Scope != "target" {
@@ -65,13 +68,16 @@ func TestSessionBreakerOpensOnDistinctRejectedTargets(t *testing.T) {
 		t.Fatalf("session opened from a single AppID: %v", err)
 	}
 
-	// Three distinct rejected AppIDs open the session on the third.
+	// The distinct-target threshold opens the session on the last distinct AppID.
 	b, _ := testBreaker(t)
-	if b.record(7, "wx1", "", circuitAppReject) == "session" || b.record(7, "wx2", "", circuitAppReject) == "session" {
-		t.Fatal("session opened before the distinct-target threshold")
+	threshold := defaultCircuitConfig().SessionDistinctTargets
+	for i := 0; i < threshold-1; i++ {
+		if scope := b.record(7, fmt.Sprintf("wx%d", i+1), "", circuitAppReject); scope == "session" {
+			t.Fatal("session opened before the distinct-target threshold")
+		}
 	}
-	if scope := b.record(7, "wx3", "", circuitAppReject); scope != "session" {
-		t.Fatalf("third distinct -14 did not open the session: %q", scope)
+	if scope := b.record(7, fmt.Sprintf("wx%d", threshold), "", circuitAppReject); scope != "session" {
+		t.Fatalf("distinct-target threshold did not open the session: %q", scope)
 	}
 	var open *circuitOpenError
 	if err := b.check(7, "wxBrandNew", ""); !errors.As(err, &open) || open.Scope != "session" {
@@ -131,8 +137,9 @@ func TestInvokeWXAppShortCircuitsWithoutUpstream(t *testing.T) {
 		return nil, &protocol.ShortlinkRejectedError{Code: -14}
 	}
 	ctx := context.Background()
-	// Two -14 open the target; the third call must be short-circuited locally.
-	for range 2 {
+	// The target opens after the configured threshold; the next call must be
+	// short-circuited locally.
+	for range defaultCircuitConfig().TargetAppRejects {
 		if _, err := app.invokeWXApp(ctx, acc, "wxTarget", nil, reject); !protocol.IsApplicationRequestRejection(err) {
 			t.Fatalf("expected -14 passthrough, got %v", err)
 		}
@@ -141,7 +148,7 @@ func TestInvokeWXAppShortCircuitsWithoutUpstream(t *testing.T) {
 	_, err := app.invokeWXApp(ctx, acc, "wxTarget", nil, reject)
 	var open *circuitOpenError
 	if !errors.As(err, &open) || open.Scope != "target" {
-		t.Fatalf("third call was not short-circuited: %v", err)
+		t.Fatalf("held-off call was not short-circuited: %v", err)
 	}
 	if calls.Load() != before {
 		t.Fatal("short-circuited request still reached the pool")
@@ -198,9 +205,12 @@ func TestWholesaleRejectionStopsUpstreamHammering(t *testing.T) {
 // not hold off wx.login for the same AppID.
 func TestRejectedPhoneRequestsDoNotHoldOffCodeRequests(t *testing.T) {
 	b, _ := testBreaker(t)
-	b.record(1, "wxJD", eventlog.OpGetPhoneNumber, circuitAppReject)
-	if scope := b.record(1, "wxJD", eventlog.OpGetPhoneNumber, circuitAppReject); scope != "target" {
-		t.Fatalf("second refused phone request did not open its own target: %q", scope)
+	var scope string
+	for i := 0; i < defaultCircuitConfig().TargetAppRejects; i++ {
+		scope = b.record(1, "wxJD", eventlog.OpGetPhoneNumber, circuitAppReject)
+	}
+	if scope != "target" {
+		t.Fatalf("threshold refused phone requests did not open its own target: %q", scope)
 	}
 	if err := b.check(1, "wxJD", eventlog.OpGetPhoneNumber); err == nil {
 		t.Fatal("phone target not held off")
@@ -228,10 +238,14 @@ func TestOnlyCodeRejectionsFeedTheSessionLayer(t *testing.T) {
 	}
 
 	codes, _ := testBreaker(t)
-	codes.record(8, "wx1", eventlog.OpGetCode, circuitAppReject)
-	codes.record(8, "wx2", eventlog.OpGetCode, circuitAppReject)
-	if scope := codes.record(8, "wx3", eventlog.OpGetCode, circuitAppReject); scope != "session" {
-		t.Fatalf("three refused code requests did not open the session: %q", scope)
+	threshold := defaultCircuitConfig().SessionDistinctTargets
+	for i := 0; i < threshold-1; i++ {
+		if scope := codes.record(8, fmt.Sprintf("wx%d", i+1), eventlog.OpGetCode, circuitAppReject); scope == "session" {
+			t.Fatalf("session opened before the distinct-target threshold")
+		}
+	}
+	if scope := codes.record(8, fmt.Sprintf("wx%d", threshold), eventlog.OpGetCode, circuitAppReject); scope != "session" {
+		t.Fatalf("distinct-target threshold refused code requests did not open the session: %q", scope)
 	}
 }
 
@@ -242,8 +256,11 @@ func TestTargetRejectionsExpireAfterTheWindow(t *testing.T) {
 	if scope := b.record(1, "wxA", "", circuitAppReject); scope != "" {
 		t.Fatalf("a rejection from long ago still counted as consecutive: %q", scope)
 	}
+	for range defaultCircuitConfig().TargetAppRejects - 2 {
+		b.record(1, "wxA", "", circuitAppReject)
+	}
 	if scope := b.record(1, "wxA", "", circuitAppReject); scope != "target" {
-		t.Fatalf("two recent rejections did not open the target: %q", scope)
+		t.Fatalf("threshold recent rejections did not open the target: %q", scope)
 	}
 }
 
@@ -323,7 +340,7 @@ func TestPhoneRejectionsDoNotBlockCodeThroughInvoke(t *testing.T) {
 	}
 	phone := withWXOperationContext(context.Background(), eventlog.OpGetPhoneNumber)
 	code := withWXOperationContext(context.Background(), eventlog.OpGetCode)
-	for range 3 {
+	for range defaultCircuitConfig().TargetAppRejects {
 		_, _ = app.invokeWXApp(phone, acc, "wxJD", nil, reject)
 	}
 	var open *circuitOpenError
@@ -341,8 +358,9 @@ func TestBreakerSaturatedWithOpenTargetsFailsOpen(t *testing.T) {
 	b, _ := testBreaker(t)
 	for i := 0; i < maxBreakerTargets; i++ {
 		account := int64(i + 1)
-		b.record(account, "wx", "", circuitAppReject)
-		b.record(account, "wx", "", circuitAppReject) // opens this target
+		for range defaultCircuitConfig().TargetAppRejects {
+			b.record(account, "wx", "", circuitAppReject)
+		} // opens this target
 	}
 	if n := len(b.targets); n != maxBreakerTargets {
 		t.Fatalf("expected a full table, got %d", n)
@@ -368,8 +386,9 @@ func TestIntegrationGetCodeReportsALocalHoldOffAs429(t *testing.T) {
 	}
 	defer app.Close()
 	acc := insertKeepAliveTestAccount(t, app, "openid-integration-429", time.Now().Add(time.Hour))
-	app.circuit.record(acc.ID, "wxHeldOff", eventlog.OpGetCode, circuitAppReject)
-	app.circuit.record(acc.ID, "wxHeldOff", eventlog.OpGetCode, circuitAppReject)
+	for i := 0; i < defaultCircuitConfig().TargetAppRejects; i++ {
+		app.circuit.record(acc.ID, "wxHeldOff", eventlog.OpGetCode, circuitAppReject)
+	}
 
 	body := fmt.Sprintf(`{"ref":"%d","app_id":"wxHeldOff"}`, acc.ID)
 	request := httptest.NewRequest(http.MethodPost, "/integration/actions/get-code", strings.NewReader(body))
