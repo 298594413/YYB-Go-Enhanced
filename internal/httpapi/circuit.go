@@ -79,13 +79,13 @@ func circuitConfigFor(disabled bool) circuitConfig {
 func defaultCircuitConfig() circuitConfig {
 	return circuitConfig{
 		Enabled:                true,
-		TargetAppRejects:       2,
+		TargetAppRejects:       4,
 		TargetEmptyCodes:       3,
-		TargetCooldown:         10 * time.Minute,
+		TargetCooldown:         5 * time.Minute,
 		TargetWindow:           30 * time.Minute,
-		SessionDistinctTargets: 3,
+		SessionDistinctTargets: 5,
 		SessionWindow:          5 * time.Minute,
-		SessionCooldown:        15 * time.Minute,
+		SessionCooldown:        10 * time.Minute,
 	}
 }
 
