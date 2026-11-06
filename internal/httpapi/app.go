@@ -30,6 +30,29 @@ import (
 	"yyb_go/internal/store"
 )
 
+// RecoveryMode values select which release's failure-recovery policy a process
+// follows after a protocol call fails. The protocol call itself, the session
+// model and every feature of the current release are unchanged: only the
+// decision of whether and how to login again differs.
+const (
+	// RecoveryModeCurrent is the shipped policy: shortcut an application -14
+	// and an empty code, retry a ManualAuth -10 with a fresh login buffer and
+	// gate every forced refresh with the per-account login budget.
+	RecoveryModeCurrent = "current"
+	// RecoveryModeV0235 applies no shortcut and no budget. Any non-transport
+	// failure invalidates the session, forces a credential refresh and retries
+	// once, so a rejection carrying -10 is repaired by rotating tokens instead
+	// of asking the buffer endpoint for a new one.
+	RecoveryModeV0235 = "v0235"
+	// RecoveryModeV0249 shortcuts only an empty code, then retries a
+	// ManualAuth -10 with a fresh login buffer without a login budget.
+	RecoveryModeV0249 = "v0249"
+	// RecoveryModeHybrid keeps the current shortcuts and the login budget but
+	// never asks for a fresh login buffer, so a rejection that also carries a
+	// ManualAuth -10 falls through to a plain credential refresh.
+	RecoveryModeHybrid = "hybrid"
+)
+
 type Config struct {
 	MaintenanceSocket string
 	UpdateProxy       string
@@ -98,6 +121,14 @@ type Config struct {
 	// set it behaves as before; a negative value switches the guard off.
 	// tuning.json overrides it at run time.
 	FreshSessionWindow time.Duration
+
+	// RecoveryMode replays the failure-recovery policy of an earlier release
+	// instead of the shipped one. Empty and RecoveryModeCurrent keep the
+	// shipped policy; RecoveryModeV0235 and RecoveryModeV0249 reproduce those
+	// releases; RecoveryModeHybrid keeps the current application -14 shortcut
+	// but never re-fetches a login buffer, so a rejection that also carries a
+	// ManualAuth -10 cannot reach the buffer endpoint.
+	RecoveryMode string
 
 	// CodeDenyAppIDs adds AppIDs that code requests refuse on top of the
 	// built-in website-application AppIDs; CodeAllowAppIDs lifts a refusal and
@@ -170,6 +201,14 @@ var swaggerDocsHandler = httpSwagger.Handler(
 )
 
 func NewApp(cfg Config) (*App, error) {
+	cfg.RecoveryMode = strings.ToLower(strings.TrimSpace(cfg.RecoveryMode))
+	switch cfg.RecoveryMode {
+	case "":
+		cfg.RecoveryMode = RecoveryModeCurrent
+	case RecoveryModeCurrent, RecoveryModeV0235, RecoveryModeV0249, RecoveryModeHybrid:
+	default:
+		return nil, errors.New("YYB_RECOVERY_MODE must be current, v0235, v0249 or hybrid")
+	}
 	cfg.ASRefreshMode = strings.ToLower(strings.TrimSpace(cfg.ASRefreshMode))
 	switch cfg.ASRefreshMode {
 	case "", "legacy_auth":
@@ -1546,25 +1585,49 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 	var codeRecovery *protocol.CodeSessionRecoveryError
 	var credentialRecovery *protocol.CodeCredentialRecoveryError
 	ticketAccessRejected := errors.As(callErr, &codeRecovery) && errors.As(callErr, &credentialRecovery)
-	if errors.Is(callErr, protocol.ErrLoginCodeUnavailable) || protocol.IsApplicationRequestRejection(callErr) || codeRecovery != nil && !ticketAccessRejected {
-		// An empty code or a bare authenticated application -14 does not
-		// establish account expiry. Other apps may use this same session.
-		return nil, callErr
+	mode := a.cfg.RecoveryMode
+	legacy235 := mode == RecoveryModeV0235
+	legacy249 := mode == RecoveryModeV0249
+	hybrid := mode == RecoveryModeHybrid
+	budgetGate := !legacy235 && !legacy249
+	unavailableCode := errors.Is(callErr, protocol.ErrLoginCodeUnavailable)
+	applicationRejected := protocol.IsApplicationRequestRejection(callErr)
+	switch {
+	case legacy235:
+		// v0.2.35 tested nothing here: every non-transport failure was repaired.
+	case legacy249:
+		if unavailableCode {
+			// An empty code does not prove the account expired. Other apps can
+			// still use this same session.
+			return nil, callErr
+		}
+	default:
+		if unavailableCode || applicationRejected || codeRecovery != nil && !ticketAccessRejected {
+			// An empty code or a bare authenticated application -14 does not
+			// establish account expiry. Other apps may use this same session.
+			return nil, callErr
+		}
 	}
 	var rejected *protocol.ManualAuthRejectedError
-	bufferRejected := errors.As(callErr, &rejected) && rejected.Code == -10
+	// v0.2.35 had no ManualAuth branch, so its -10 falls through to the forced
+	// refresh below like any other failure. Keeping bufferRejected false also
+	// restores the transport test that treats a rejected buffer as retryable.
+	bufferRejected := !legacy235 && errors.As(callErr, &rejected) && rejected.Code == -10
 	var networkErr net.Error
 	if ctx.Err() != nil || (!bufferRejected && (errors.Is(callErr, context.Canceled) || errors.Is(callErr, context.DeadlineExceeded) || errors.As(callErr, &networkErr) || errors.Is(callErr, io.EOF) || errors.Is(callErr, io.ErrUnexpectedEOF))) {
 		// A failed transport does not establish that saved credentials expired.
 		// Preserve the session and original diagnostic; do not repeat a slow call.
 		return nil, callErr
 	}
-	if bufferRejected && !ticketAccessRejected {
+	// RecoveryModeHybrid keeps the shortcuts above but never asks the buffer
+	// endpoint for a replacement: that request is what answers 40188 when the
+	// upstream has already refused the same session for the operation.
+	if bufferRejected && !ticketAccessRejected && !hybrid {
 		// ManualAuth rejected the saved buffer before sending the operation.
 		// The access token may still be usable: fetch a fresh buffer without
 		// rotating tokens or changing scan/expiry timestamps. Pool persists the
 		// replacement protocol session, so no account credential write is needed.
-		if !a.pool.AllowLogin(acc.ID, protocol.ProviderOf(acc)) {
+		if budgetGate && !a.pool.AllowLogin(acc.ID, protocol.ProviderOf(acc)) {
 			return nil, errors.Join(callErr, errLoginBudget)
 		}
 		buffer, bufferErr := a.fetchAccountLoginBuffer(ctx, acc)
@@ -1592,10 +1655,12 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 	// A forced refresh is another OAuth-layer call. Past the account's login
 	// budget the request fails with the error it has, and the cached session is
 	// left alone rather than invalidated for a repair that will not happen.
-	if !a.pool.AllowLogin(acc.ID, protocol.ProviderOf(acc)) {
+	// v0.2.35 and v0.2.49 had no budget at all and always repaired.
+	if budgetGate && !a.pool.AllowLogin(acc.ID, protocol.ProviderOf(acc)) {
 		return nil, errors.Join(callErr, errLoginBudget)
 	}
-	if !ticketAccessRejected {
+	if legacy235 || !ticketAccessRejected {
+		// v0.2.35 invalidated the session unconditionally before refreshing.
 		_ = a.db.InvalidateSessionForAccount(ctx, acc, proxyValue)
 	}
 	// Credential recovery always uses the account's refresh route, even when

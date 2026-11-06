@@ -164,6 +164,10 @@ func main() {
 		// would work, so the window can be shortened or switched off.
 		FreshSessionWindow: envFreshSessionWindow("YYB_FRESH_SESSION_WINDOW"),
 
+		// Replays an earlier release's failure-recovery policy without changing
+		// the protocol calls or any feature; current, v0235, v0249 or hybrid.
+		RecoveryMode: strings.ToLower(strings.TrimSpace(os.Getenv("YYB_RECOVERY_MODE"))),
+
 		// Website-application AppIDs never get a code and cost the account its
 		// authorization, so code requests refuse the known ones by default.
 		CodeDenyAppIDs:  envList("YYB_CODE_DENY_APPIDS"),
